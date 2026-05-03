@@ -32,6 +32,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--beta", type=float, default=0.4)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--system-prompt", default="Please reason step by step.")
+    parser.add_argument("--answer-field", default=None, help="Optional answer field used for correctness gating")
+    parser.add_argument("--require-correct", action="store_true", help="Only log candidates from correct expert generations")
+    parser.add_argument("--reject-degenerate", action="store_true", help="Reject obvious prompt-copying/repetition generations")
     return parser.parse_args()
 
 
@@ -54,10 +57,12 @@ def main() -> None:
         beta=args.beta,
         batch_size=args.batch_size,
         system_prompt=args.system_prompt,
+        answer_field=args.answer_field,
+        require_correct=args.require_correct,
+        reject_degenerate=args.reject_degenerate,
     )
     print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":
     main()
-

@@ -1,0 +1,30 @@
+{
+  "selector": {
+    "name": "rule_v2_balanced",
+    "min_expert_confidence": 0.15,
+    "max_expert_entropy": 2.5,
+    "min_entropy_gap": 0.0,
+    "allowed_token_categories": [
+      "number",
+      "operator",
+      "equals",
+      "variable",
+      "currency_or_unit",
+      "final_answer_marker",
+      "word"
+    ],
+    "denied_token_categories": [
+      "punctuation",
+      "space"
+    ],
+    "step_type_thresholds": {
+      "setup": 0.35,
+      "calculation": 0.2,
+      "transformation": 0.3,
+      "verification": 0.35,
+      "final_answer": 0.25,
+      "other": 0.45
+    }
+  }
+}
+

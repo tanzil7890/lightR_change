@@ -1,0 +1,30 @@
+{
+  "selector": {
+    "name": "rule_v3_reasoning_focus",
+    "min_expert_confidence": 0.1,
+    "max_expert_entropy": 3.0,
+    "min_entropy_gap": -0.25,
+    "allowed_token_categories": [
+      "number",
+      "operator",
+      "equals",
+      "variable",
+      "currency_or_unit",
+      "final_answer_marker"
+    ],
+    "denied_token_categories": [
+      "punctuation",
+      "space",
+      "newline",
+      "word"
+    ],
+    "step_type_thresholds": {
+      "setup": 0.2,
+      "calculation": 0.1,
+      "transformation": 0.2,
+      "verification": 0.25,
+      "final_answer": 0.15,
+      "other": 0.3
+    }
+  }
+}

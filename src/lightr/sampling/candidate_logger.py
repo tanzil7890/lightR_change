@@ -8,6 +8,7 @@ recomputing expert and amateur model distributions.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from lightr.data.schemas import CANDIDATE_SCHEMA_VERSION
+from lightr.evaluation.gsm8k_eval import extract_gsm8k_gold, extract_predicted_answer
 from lightr.features.candidate_features import position_features
 from lightr.features.distribution_features import compute_distribution_features
 from lightr.features.step_type_features import step_type_features
@@ -102,6 +104,57 @@ def build_contrastive_target(expert_dist, amateur_dist, tokenizer, *, alpha: flo
     }
 
 
+def _normalized_for_matching(text: str) -> str:
+    return re.sub(r"\s+", " ", text.lower()).strip()
+
+
+def detect_degenerate_generation(
+    generation: str,
+    *,
+    question: str,
+    system_prompt: str,
+) -> tuple[bool, list[str]]:
+    """Detect obvious prompt-copying and repetition artifacts.
+
+    This is intentionally conservative. It is a gate for candidate logging, not
+    a learned quality classifier.
+    """
+    reasons: list[str] = []
+    normalized = _normalized_for_matching(generation)
+    normalized_question = _normalized_for_matching(question)
+    normalized_system = _normalized_for_matching(system_prompt)
+
+    if not normalized:
+        reasons.append("empty_generation")
+
+    if normalized_system and normalized.count(normalized_system[:80]) >= 1:
+        reasons.append("copies_system_prompt")
+
+    if len(normalized_question) >= 80 and normalized_question[:80] in normalized:
+        reasons.append("copies_question")
+
+    artifact_patterns = {
+        "ager": r"\bager\w*\b",
+        "highlight": r"\bhighlight\b",
+    }
+    for name, pattern in artifact_patterns.items():
+        if len(re.findall(pattern, normalized)) >= 3:
+            reasons.append(f"repeated_artifact:{name}")
+
+    if re.search(r"\b([a-zA-Z]{3,})\b(?:\s+\1\b){4,}", normalized):
+        reasons.append("repeated_word")
+
+    lines = [line.strip() for line in generation.splitlines() if len(line.strip()) >= 24]
+    line_counts: dict[str, int] = {}
+    for line in lines:
+        key = _normalized_for_matching(line)
+        line_counts[key] = line_counts.get(key, 0) + 1
+    if any(count >= 3 for count in line_counts.values()):
+        reasons.append("repeated_line")
+
+    return bool(reasons), reasons
+
+
 def log_candidates(
     *,
     expert_model_path: str,
@@ -120,6 +173,9 @@ def log_candidates(
     beta: float,
     batch_size: int,
     system_prompt: str,
+    answer_field: str | None = None,
+    require_correct: bool = False,
+    reject_degenerate: bool = False,
 ) -> dict[str, int]:
     prompts = load_prompts(input_path, prompt_field=prompt_field, id_field=id_field, max_questions=max_questions)
     processed_ids = load_processed_ids(checkpoint_path)
@@ -141,6 +197,8 @@ def log_candidates(
     prompt_count = 0
     candidate_count = 0
     skipped_count = 0
+    rejected_incorrect_count = 0
+    rejected_degenerate_count = 0
 
     for prompt_obj in tqdm(prompts, desc="Logging candidates"):
         prompt_id = str(prompt_obj["prompt_id"])
@@ -165,6 +223,58 @@ def log_candidates(
             )
 
         expert_targets = outputs.sequences[0][model_inputs.input_ids.shape[1] :].tolist()
+        expert_generation = tokenizer.decode(expert_targets, skip_special_tokens=True)
+
+        raw_record = prompt_obj.get("raw", {})
+        gold_answer = None
+        predicted_answer = None
+        is_correct = None
+        if answer_field:
+            if answer_field not in raw_record:
+                raise ValueError(f"Answer field {answer_field!r} missing from input record")
+            gold_answer = extract_gsm8k_gold(str(raw_record[answer_field]))
+            predicted_answer = extract_predicted_answer(expert_generation)
+            is_correct = predicted_answer == gold_answer
+            if require_correct and not is_correct:
+                rejected_incorrect_count += 1
+                if checkpoint_path is not None:
+                    _append_jsonl(
+                        checkpoint_path,
+                        {
+                            "prompt_id": prompt_id,
+                            "num_steps": len(expert_targets),
+                            "num_candidates": 0,
+                            "accepted": False,
+                            "rejection_reason": "incorrect_expert_generation",
+                            "gold_answer": gold_answer,
+                            "predicted_answer": predicted_answer,
+                        },
+                    )
+                continue
+
+        is_degenerate, degeneration_reasons = detect_degenerate_generation(
+            expert_generation,
+            question=question,
+            system_prompt=system_prompt,
+        )
+        if reject_degenerate and is_degenerate:
+            rejected_degenerate_count += 1
+            if checkpoint_path is not None:
+                _append_jsonl(
+                    checkpoint_path,
+                    {
+                        "prompt_id": prompt_id,
+                        "num_steps": len(expert_targets),
+                        "num_candidates": 0,
+                        "accepted": False,
+                        "rejection_reason": "degenerate_expert_generation",
+                        "degeneration_reasons": degeneration_reasons,
+                        "gold_answer": gold_answer,
+                        "predicted_answer": predicted_answer,
+                    },
+                )
+            continue
+
         expert_probs = [F.softmax(score[0], dim=-1) for score in outputs.scores]
         sequence_length = len(expert_targets)
 
@@ -228,6 +338,13 @@ def log_candidates(
                 "step_features": step_type_features(prefixes[offset], target_token_text),
                 "contrastive_target": contrastive_target,
                 "fixed_kl_selected": bool(distribution["kl_expert_amateur"] >= beta),
+                "expert_generation_metadata": {
+                    "gold_answer": gold_answer,
+                    "predicted_answer": predicted_answer,
+                    "is_correct": is_correct,
+                    "is_degenerate": is_degenerate,
+                    "degeneration_reasons": degeneration_reasons,
+                },
             }
             _append_jsonl(output_path, candidate)
             prompt_candidates += 1
@@ -240,6 +357,12 @@ def log_candidates(
                     "prompt_id": prompt_id,
                     "num_steps": sequence_length,
                     "num_candidates": prompt_candidates,
+                    "accepted": True,
+                    "gold_answer": gold_answer,
+                    "predicted_answer": predicted_answer,
+                    "is_correct": is_correct,
+                    "is_degenerate": is_degenerate,
+                    "degeneration_reasons": degeneration_reasons,
                 },
             )
         prompt_count += 1
@@ -247,6 +370,7 @@ def log_candidates(
     return {
         "prompts_processed": prompt_count,
         "prompts_skipped": skipped_count,
+        "prompts_rejected_incorrect": rejected_incorrect_count,
+        "prompts_rejected_degenerate": rejected_degenerate_count,
         "candidates_written": candidate_count,
     }
-

@@ -58,13 +58,55 @@ def validate_candidate_record(record: dict[str, Any]) -> None:
         raise ValueError("candidate tokens and token_ids lengths differ")
 
 
+def filter_target_for_training_vocab(
+    target: dict[str, Any],
+    *,
+    max_token_id_exclusive: int | None,
+) -> tuple[dict[str, Any] | None, int]:
+    """Drop target tokens that the current trainer cannot represent.
+
+    `LightR_finetuning.py` uses `tokenizer.vocab_size` as the label dimension.
+    Some Qwen special tokens, such as eos/pad id 151643, are valid tokenizer ids
+    but are outside `tokenizer.vocab_size`. Those ids must be dropped before
+    selected samples are sent to the existing trainer.
+    """
+    if max_token_id_exclusive is None:
+        return target, 0
+
+    kept_tokens = []
+    kept_token_ids = []
+    kept_weights = []
+    dropped = 0
+    for token, token_id, weight in zip(target["tokens"], target["token_ids"], target["weights"]):
+        if 0 <= int(token_id) < max_token_id_exclusive:
+            kept_tokens.append(token)
+            kept_token_ids.append(token_id)
+            kept_weights.append(float(weight))
+        else:
+            dropped += 1
+
+    if not kept_token_ids:
+        return None, dropped
+
+    weight_sum = sum(kept_weights)
+    if weight_sum <= 0:
+        return None, dropped
+
+    return {
+        "tokens": kept_tokens,
+        "token_ids": kept_token_ids,
+        "weights": [weight / weight_sum for weight in kept_weights],
+    }, dropped
+
+
 def candidate_to_selected_sample(
     candidate: dict[str, Any],
     *,
     selector_name: str,
     selector_score: float | None = None,
     prompt_text_field: str = "question",
-) -> dict[str, Any]:
+    max_token_id_exclusive: int | None = None,
+) -> dict[str, Any] | None:
     """Convert a candidate record to the current LightReasoner training schema.
 
     `LightR_finetuning.py` treats `prompt_id` as the actual user question. For
@@ -72,7 +114,12 @@ def candidate_to_selected_sample(
     falls back to candidate["prompt_id"].
     """
     validate_candidate_record(candidate)
-    target = candidate["contrastive_target"]
+    target, dropped_token_count = filter_target_for_training_vocab(
+        candidate["contrastive_target"],
+        max_token_id_exclusive=max_token_id_exclusive,
+    )
+    if target is None:
+        return None
     distribution_features = candidate["distribution_features"]
     token_features = candidate.get("token_features", {})
     step_features = candidate.get("step_features", {})
@@ -92,8 +139,9 @@ def candidate_to_selected_sample(
             "original_prompt_id": candidate["prompt_id"],
             "token_category": token_features.get("token_category"),
             "step_type": step_features.get("step_type"),
+            "dropped_out_of_vocab_target_tokens": dropped_token_count,
+            "max_token_id_exclusive": max_token_id_exclusive,
         },
     }
     validate_selected_sample(selected)
     return selected
-

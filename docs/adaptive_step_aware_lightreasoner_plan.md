@@ -1229,12 +1229,51 @@ Verify adaptive selected samples can train the expert without modifying
 `LightR_finetuning.py`.
 
 Status: schema-level compatibility checker implemented and tested on real
-pre-collected selected samples. Actual LoRA loss-decrease test is pending local
-models/GPU.
+selected samples from the 50-question RunPod candidate run. A configurable LoRA
+fine-tuning runner has also been implemented so adaptive datasets can be trained
+without editing `LightR_finetuning.py`. Five-step RunPod smoke runs completed
+for Fixed KL equal-budget and Rule balanced, with finite training loss and saved
+LoRA adapters. The 100-step matched training runs also completed. Downstream
+GSM8K-100 evaluation completed, but the 50-question pilot did not improve
+accuracy: base 19%, equal-budget Fixed KL 18%, Rule balanced 16%.
+Comparison analysis showed Rule balanced improves some base-wrong examples but
+regresses more base-correct examples, with visible prompt-copying/artifact
+generation in some outputs. A reasoning-focused selector config has been added
+for the next diagnostic. On the existing 50-question candidate log,
+`rule_v3_reasoning_focus` selected 83 samples and 112 target tokens, with no
+generic word/punctuation/space/newline tokens; it is compatible with the
+trainer. A conservative 20-step run completed, but the first GSM8K-30 fast
+evaluation with 128 generated tokens was poor: 2/30. A fair same-setting
+comparison showed the fast 128-token diagnostic is too harsh overall: base
+1/30, Fixed KL 2/30, Rule balanced 1/30, reasoning-focus 2/30. Future quick
+checks should use batched 30-example evaluation with 256 generated tokens.
+Under that setting, base scored 3/30 and reasoning-focus scored 4/30, a weak
+positive signal. The completed same-setting comparison was: base 3/30,
+equal-budget Fixed KL 5/30, Rule balanced 4/30, reasoning-focus 4/30. This
+means reasoning-focus does not beat Fixed KL in the 50-question pilot; the next
+meaningful step is a larger 500-question candidate log with equal-budget
+selector comparisons.
 
-Implemented file:
+Current pivot:
+
+- Add correctness-gated candidate logging.
+- Add degeneration filtering before candidate records are written.
+- Only train on expert trajectories that are correct and not obviously
+  degenerate.
+- This addresses the main failure mode from the 50-question pilot: selected
+  tokens can be reasoning-critical but still come from bad expert trajectories.
+
+Implemented files:
 
 - `scripts/check_finetuning_compatibility.py`
+- `scripts/log_candidates.py`
+- `scripts/run_contrastive_finetune.py`
+- `src/lightr/training/contrastive_finetuning.py`
+- `scripts/evaluate_gsm8k_adapter.py`
+- `scripts/compare_gsm8k_eval_outputs.py`
+- `src/lightr/evaluation/gsm8k_eval.py`
+- `src/lightr/sampling/candidate_logger.py`
+- `configs/adaptive_sampling/qwen15_gsm8k_rule_selector_reasoning_focus.json`
 
 Tasks:
 
@@ -1456,7 +1495,8 @@ Do this first:
    real model run pending local model paths/GPU.
 5. Create `scripts/select_candidates.py` with fixed-KL selection. Completed.
 6. Confirm selected output works with `LightR_finetuning.py`. Schema
-   compatibility checker completed; real LoRA smoke run pending model paths/GPU.
+   compatibility checker completed; configurable LoRA smoke runner completed;
+   real loss-decrease result pending RunPod execution.
 7. Add rule selector. Completed.
 8. Add selection report. Completed.
 

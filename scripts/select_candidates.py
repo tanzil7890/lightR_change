@@ -40,6 +40,17 @@ def build_selector(args: argparse.Namespace):
     raise ValueError(f"Unsupported selector: {args.selector}")
 
 
+def load_max_token_id_exclusive(args: argparse.Namespace) -> int | None:
+    if args.max_token_id_exclusive is not None:
+        return args.max_token_id_exclusive
+    if args.model_path is None:
+        return None
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    return tokenizer.vocab_size
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, help="Candidate JSONL path")
@@ -48,6 +59,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default=None, help="Optional JSON selector config")
     parser.add_argument("--beta", type=float, default=0.4, help="Fallback beta for fixed_kl")
     parser.add_argument("--prompt-text-field", default="question")
+    parser.add_argument("--model-path", default=None, help="Optional tokenizer/model path used to filter trainer-vocab ids")
+    parser.add_argument(
+        "--max-token-id-exclusive",
+        type=int,
+        default=None,
+        help="Drop selected target ids >= this value and renormalize weights",
+    )
     parser.add_argument("--max-samples", type=int, default=None, help="Keep at most this many selected samples")
     parser.add_argument(
         "--max-target-tokens",
@@ -98,6 +116,7 @@ def _apply_budgets(rows: list[tuple[dict[str, Any], Any]], args: argparse.Namesp
 def main() -> None:
     args = parse_args()
     selector = build_selector(args)
+    max_token_id_exclusive = load_max_token_id_exclusive(args)
     total = 0
     reason_counts: dict[str, int] = {}
     selected_rows = []
@@ -112,20 +131,24 @@ def main() -> None:
     pre_budget_selected = len(selected_rows)
     selected_rows = _apply_budgets(selected_rows, args)
 
-    selected_count = len(selected_rows)
-    selected_target_tokens = sum(_target_size(candidate) for candidate, _decision in selected_rows)
-    write_jsonl(
-        args.output,
-        (
-            candidate_to_selected_sample(
-                candidate,
-                selector_name=selector.name,
-                selector_score=decision.score,
-                prompt_text_field=args.prompt_text_field,
-            )
-            for candidate, decision in selected_rows
-        ),
-    )
+    selected_samples = []
+    dropped_empty_samples = 0
+    for candidate, decision in selected_rows:
+        sample = candidate_to_selected_sample(
+            candidate,
+            selector_name=selector.name,
+            selector_score=decision.score,
+            prompt_text_field=args.prompt_text_field,
+            max_token_id_exclusive=max_token_id_exclusive,
+        )
+        if sample is None:
+            dropped_empty_samples += 1
+            continue
+        selected_samples.append(sample)
+
+    selected_count = len(selected_samples)
+    selected_target_tokens = sum(len(sample["token_ids"]) for sample in selected_samples)
+    write_jsonl(args.output, selected_samples)
     summary = {
         "selector": selector.name,
         "input": args.input,
@@ -133,7 +156,9 @@ def main() -> None:
         "candidates_seen": total,
         "samples_selected_before_budget": pre_budget_selected,
         "samples_selected": selected_count,
+        "samples_dropped_after_vocab_filter": dropped_empty_samples,
         "selected_target_tokens": selected_target_tokens,
+        "max_token_id_exclusive": max_token_id_exclusive,
         "selection_rate": selected_count / total if total else 0.0,
         "reason_counts": reason_counts,
     }
